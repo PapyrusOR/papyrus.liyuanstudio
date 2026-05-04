@@ -3,7 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const fs = require('fs');
+const { DatabaseSync } = require('node:sqlite');
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_BASE = 'https://api.deepseek.com/v1';
@@ -21,11 +21,53 @@ if (!DEEPSEEK_API_KEY) {
   process.exit(1);
 }
 
-const USAGE_FILE = path.join(__dirname, 'usage.json');
-const KEYS_FILE = path.join(__dirname, 'keys.json');
-const REGISTER_FILE = path.join(__dirname, 'register.json');
-const ANON_KEYS_FILE = path.join(__dirname, 'anon_keys.json');
+// ===== SQLite =====
+const DB_FILE = path.join(__dirname, 'proxy.db');
+const db = new DatabaseSync(DB_FILE);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS keys (
+    key TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    created_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS key_usage (
+    key TEXT PRIMARY KEY,
+    date TEXT NOT NULL,
+    tokens INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS register_log (
+    ip TEXT PRIMARY KEY,
+    date TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS anon_keys (
+    ident TEXT PRIMARY KEY,
+    key TEXT NOT NULL,
+    date TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS daily_global (
+    date TEXT PRIMARY KEY,
+    tokens INTEGER NOT NULL DEFAULT 0
+  );
+`);
+
+const stmtInsertKey = db.prepare('INSERT OR IGNORE INTO keys (key, type, created_at) VALUES (?, ?, ?)');
+const stmtInsertUsage = db.prepare('INSERT OR REPLACE INTO key_usage (key, date, tokens) VALUES (?, ?, ?)');
+const stmtInsertGlobal = db.prepare('INSERT OR REPLACE INTO daily_global (date, tokens) VALUES (?, ?)');
+const stmtInsertRegister = db.prepare('INSERT OR REPLACE INTO register_log (ip, date, count) VALUES (?, ?, ?)');
+const stmtInsertAnon = db.prepare('INSERT OR REPLACE INTO anon_keys (ident, key, date) VALUES (?, ?, ?)');
+const stmtDeleteOldUsage = db.prepare("DELETE FROM key_usage WHERE date != ?");
+const stmtDeleteOldGlobal = db.prepare("DELETE FROM daily_global WHERE date != ?");
+const stmtDeleteOldRegister = db.prepare("DELETE FROM register_log WHERE date != ?");
+const stmtDeleteOldAnon = db.prepare("DELETE FROM anon_keys WHERE date != ?");
+const stmtDeleteOldKeys = db.prepare("DELETE FROM keys WHERE type = 'anonymous' AND key NOT IN (SELECT key FROM anon_keys)");
+
+// ===== In-memory cache =====
 let globalUsage = { date: getToday(), tokens: 0 };
 const keyUsageMap = new Map();
 let validKeys = new Set(PRESET_KEYS);
@@ -39,10 +81,18 @@ function getToday() {
 function resetIfNewDay() {
   const today = getToday();
   if (globalUsage.date !== today) {
+    const oldDate = globalUsage.date;
     globalUsage = { date: today, tokens: 0 };
     keyUsageMap.clear();
     registerLog.clear();
     anonKeyMap.clear();
+
+    // Purge stale data from SQLite
+    stmtDeleteOldUsage.run(today);
+    stmtDeleteOldGlobal.run(today);
+    stmtDeleteOldRegister.run(today);
+    stmtDeleteOldAnon.run(today);
+    stmtDeleteOldKeys.run();
   }
 }
 
@@ -50,135 +100,74 @@ function addUsage(tokens, key) {
   resetIfNewDay();
   globalUsage.tokens += tokens;
   keyUsageMap.set(key, (keyUsageMap.get(key) || 0) + tokens);
+
+  // Persist immediately
+  stmtInsertUsage.run(key, globalUsage.date, keyUsageMap.get(key));
+  stmtInsertGlobal.run(globalUsage.date, globalUsage.tokens);
 }
 
 function loadUsage() {
-  try {
-    if (fs.existsSync(USAGE_FILE)) {
-      const raw = fs.readFileSync(USAGE_FILE, 'utf-8');
-      const data = JSON.parse(raw);
-      if (data.date === getToday()) {
-        globalUsage = { date: data.date, tokens: data.global || 0 };
-        if (data.keys) {
-          for (const [k, v] of Object.entries(data.keys)) {
-            keyUsageMap.set(k, v);
-          }
-        }
-        console.log(`Loaded usage: ${globalUsage.tokens.toLocaleString()} tokens today`);
-      } else {
-        console.log('Usage file is stale, starting fresh');
-      }
-    }
-  } catch (e) {
-    console.error('Failed to load usage.json:', e.message);
+  const today = getToday();
+  const row = db.prepare('SELECT tokens FROM daily_global WHERE date = ?').get(today);
+  if (row) {
+    globalUsage = { date: today, tokens: row.tokens };
   }
-}
 
-function saveUsage() {
-  try {
-    resetIfNewDay();
-    const keys = Object.fromEntries(keyUsageMap);
-    const data = { date: globalUsage.date, global: globalUsage.tokens, keys };
-    fs.writeFileSync(USAGE_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error('Failed to save usage.json:', e.message);
+  const usageRows = db.prepare('SELECT key, tokens FROM key_usage WHERE date = ?').all(today);
+  for (const r of usageRows) {
+    keyUsageMap.set(r.key, r.tokens);
   }
+  console.log(`Loaded usage: ${globalUsage.tokens.toLocaleString()} tokens today`);
 }
 
 function loadKeys() {
-  try {
-    if (fs.existsSync(KEYS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf-8'));
-      const keys = data.keys || [];
-      for (const k of keys) validKeys.add(k);
-    }
-  } catch (e) {
-    console.error('Failed to load keys.json:', e.message);
+  // Seed preset keys into DB on first run
+  const today = getToday();
+  for (const k of PRESET_KEYS) {
+    stmtInsertKey.run(k, 'preset', today);
+    validKeys.add(k);
   }
-}
 
-function saveKeys() {
-  try {
-    fs.writeFileSync(KEYS_FILE, JSON.stringify({ keys: [...validKeys] }, null, 2));
-  } catch (e) {
-    console.error('Failed to save keys.json:', e.message);
-  }
+  const rows = db.prepare("SELECT key FROM keys").all();
+  for (const r of rows) validKeys.add(r.key);
 }
 
 function loadRegisterLog() {
-  try {
-    if (fs.existsSync(REGISTER_FILE)) {
-      const data = JSON.parse(fs.readFileSync(REGISTER_FILE, 'utf-8'));
-      if (data.date === getToday() && data.ips) {
-        for (const [ip, log] of Object.entries(data.ips)) {
-          registerLog.set(ip, log);
-        }
-        console.log(`Loaded register log: ${registerLog.size} IPs`);
-      } else {
-        console.log('Register log is stale, starting fresh');
-      }
-    }
-  } catch (e) {
-    console.error('Failed to load register.json:', e.message);
-  }
-}
-
-function saveRegisterLog() {
-  try {
-    resetIfNewDay();
-    const ips = Object.fromEntries(registerLog);
-    fs.writeFileSync(REGISTER_FILE, JSON.stringify({ date: globalUsage.date, ips }, null, 2));
-  } catch (e) {
-    console.error('Failed to save register.json:', e.message);
-  }
+  const rows = db.prepare('SELECT ip, date, count FROM register_log').all();
+  for (const r of rows) registerLog.set(r.ip, { date: r.date, count: r.count });
+  console.log(`Loaded register log: ${registerLog.size} IPs`);
 }
 
 function loadAnonKeys() {
-  try {
-    if (fs.existsSync(ANON_KEYS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(ANON_KEYS_FILE, 'utf-8'));
-      if (data.date === getToday() && data.mappings) {
-        for (const [ident, key] of Object.entries(data.mappings)) {
-          anonKeyMap.set(ident, key);
-          validKeys.add(key);
-        }
-        console.log(`Loaded anon keys: ${anonKeyMap.size} mappings`);
-      } else {
-        console.log('Anon keys file is stale, starting fresh');
-      }
+  const today = getToday();
+  const rows = db.prepare('SELECT ident, key, date FROM anon_keys').all();
+  for (const r of rows) {
+    if (r.date === today) {
+      anonKeyMap.set(r.ident, r.key);
+      validKeys.add(r.key);
     }
-  } catch (e) {
-    console.error('Failed to load anon_keys.json:', e.message);
   }
-}
-
-function saveAnonKeys() {
-  try {
-    resetIfNewDay();
-    const mappings = Object.fromEntries(anonKeyMap);
-    fs.writeFileSync(ANON_KEYS_FILE, JSON.stringify({ date: globalUsage.date, mappings }, null, 2));
-  } catch (e) {
-    console.error('Failed to save anon_keys.json:', e.message);
-  }
+  console.log(`Loaded anon keys: ${anonKeyMap.size} mappings`);
 }
 
 function generateKey() {
   return 'pk-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-const saveInterval = setInterval(() => {
-  saveUsage();
-  saveKeys();
-  saveRegisterLog();
-  saveAnonKeys();
-}, 300_000);
+function persistKey(key, type) {
+  stmtInsertKey.run(key, type, getToday());
+}
+
+function persistRegisterLog(ip, date, count) {
+  stmtInsertRegister.run(ip, date, count);
+}
+
+function persistAnonKey(ident, key, date) {
+  stmtInsertAnon.run(ident, key, date);
+}
 
 function gracefulExit() {
-  clearInterval(saveInterval);
-  saveUsage();
-  saveKeys();
-  saveRegisterLog();
-  saveAnonKeys();
+  db.close();
   process.exit(0);
 }
 
@@ -258,15 +247,16 @@ function authMiddleware(req, res, next) {
   const newKey = generateKey();
   validKeys.add(newKey);
   anonKeyMap.set(anonIdent, newKey);
-  saveKeys();
-  saveAnonKeys();
+  persistKey(newKey, 'anonymous');
+  persistAnonKey(anonIdent, newKey, getToday());
 
   if (!log || log.date !== getToday()) {
     registerLog.set(ip, { date: getToday(), count: 1 });
+    persistRegisterLog(ip, getToday(), 1);
   } else {
     log.count++;
+    persistRegisterLog(ip, log.date, log.count);
   }
-  saveRegisterLog();
 
   req.apiKey = newKey;
   next();
@@ -292,12 +282,14 @@ app.post('/v1/register', (req, res) => {
 
   const key = generateKey();
   validKeys.add(key);
-  saveKeys();
+  persistKey(key, 'registered');
 
   if (!log || log.date !== today) {
     registerLog.set(ip, { date: today, count: 1 });
+    persistRegisterLog(ip, today, 1);
   } else {
     log.count++;
+    persistRegisterLog(ip, log.date, log.count);
   }
 
   res.json({
@@ -425,5 +417,5 @@ loadAnonKeys();
 app.listen(PORT, () => {
   console.log(`Papyrus LiYuan DeepSeek Proxy running on port ${PORT}`);
   console.log(`Daily quota: ${DAILY_QUOTA_PER_KEY.toLocaleString()} tokens per key`);
-  console.log(`Preset keys: ${PRESET_KEYS.length}, Registered keys: ${validKeys.size - PRESET_KEYS.length}, Anonymous mappings: ${anonKeyMap.size}`);
+  console.log(`Preset keys: ${PRESET_KEYS.length}, Total keys: ${validKeys.size}, Anonymous mappings: ${anonKeyMap.size}`);
 });
