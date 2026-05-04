@@ -190,6 +190,24 @@ app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
+// User-Agent guard — reject requests not from Papyrus Desktop
+function userAgentGuard(req, res, next) {
+  const ua = req.headers['user-agent'] || '';
+  if (!ua.includes('PapyrusDesktop')) {
+    res.status(403).json({
+      error: {
+        message: 'Access denied: unsupported client',
+        type: 'access_denied',
+      },
+    });
+    return;
+  }
+  next();
+}
+
+// Apply UA guard to all /v1/* API routes
+app.use('/v1', userAgentGuard);
+
 function getClientIp(req) {
   const cfIp = req.headers['cf-connecting-ip'];
   if (cfIp) return String(cfIp).trim();
