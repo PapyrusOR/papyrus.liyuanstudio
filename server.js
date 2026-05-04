@@ -23,11 +23,14 @@ if (!DEEPSEEK_API_KEY) {
 
 const USAGE_FILE = path.join(__dirname, 'usage.json');
 const KEYS_FILE = path.join(__dirname, 'keys.json');
+const REGISTER_FILE = path.join(__dirname, 'register.json');
+const ANON_KEYS_FILE = path.join(__dirname, 'anon_keys.json');
 
 let globalUsage = { date: getToday(), tokens: 0 };
 const keyUsageMap = new Map();
 let validKeys = new Set(PRESET_KEYS);
 const registerLog = new Map(); // ip -> { date, count }
+const anonKeyMap = new Map(); // ident -> key
 
 function getToday() {
   return new Date().toISOString().slice(0, 10);
@@ -39,6 +42,7 @@ function resetIfNewDay() {
     globalUsage = { date: today, tokens: 0 };
     keyUsageMap.clear();
     registerLog.clear();
+    anonKeyMap.clear();
   }
 }
 
@@ -101,6 +105,63 @@ function saveKeys() {
   }
 }
 
+function loadRegisterLog() {
+  try {
+    if (fs.existsSync(REGISTER_FILE)) {
+      const data = JSON.parse(fs.readFileSync(REGISTER_FILE, 'utf-8'));
+      if (data.date === getToday() && data.ips) {
+        for (const [ip, log] of Object.entries(data.ips)) {
+          registerLog.set(ip, log);
+        }
+        console.log(`Loaded register log: ${registerLog.size} IPs`);
+      } else {
+        console.log('Register log is stale, starting fresh');
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load register.json:', e.message);
+  }
+}
+
+function saveRegisterLog() {
+  try {
+    resetIfNewDay();
+    const ips = Object.fromEntries(registerLog);
+    fs.writeFileSync(REGISTER_FILE, JSON.stringify({ date: globalUsage.date, ips }, null, 2));
+  } catch (e) {
+    console.error('Failed to save register.json:', e.message);
+  }
+}
+
+function loadAnonKeys() {
+  try {
+    if (fs.existsSync(ANON_KEYS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ANON_KEYS_FILE, 'utf-8'));
+      if (data.date === getToday() && data.mappings) {
+        for (const [ident, key] of Object.entries(data.mappings)) {
+          anonKeyMap.set(ident, key);
+          validKeys.add(key);
+        }
+        console.log(`Loaded anon keys: ${anonKeyMap.size} mappings`);
+      } else {
+        console.log('Anon keys file is stale, starting fresh');
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load anon_keys.json:', e.message);
+  }
+}
+
+function saveAnonKeys() {
+  try {
+    resetIfNewDay();
+    const mappings = Object.fromEntries(anonKeyMap);
+    fs.writeFileSync(ANON_KEYS_FILE, JSON.stringify({ date: globalUsage.date, mappings }, null, 2));
+  } catch (e) {
+    console.error('Failed to save anon_keys.json:', e.message);
+  }
+}
+
 function generateKey() {
   return 'pk-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
@@ -108,12 +169,16 @@ function generateKey() {
 const saveInterval = setInterval(() => {
   saveUsage();
   saveKeys();
+  saveRegisterLog();
+  saveAnonKeys();
 }, 300_000);
 
 function gracefulExit() {
   clearInterval(saveInterval);
   saveUsage();
   saveKeys();
+  saveRegisterLog();
+  saveAnonKeys();
   process.exit(0);
 }
 
@@ -125,25 +190,73 @@ app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
+function getClientIp(req) {
+  const cfIp = req.headers['cf-connecting-ip'];
+  if (cfIp) return String(cfIp).trim();
+
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    const first = String(forwarded).split(',')[0].trim();
+    if (first) return first;
+  }
+
+  return req.ip || req.socket.remoteAddress || 'unknown';
+}
+
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || '';
   const token = auth.replace(/^Bearer\s+/i, '').trim();
-  if (!validKeys.has(token)) {
-    res.status(401).json({
+
+  if (validKeys.has(token)) {
+    req.apiKey = token;
+    next();
+    return;
+  }
+
+  resetIfNewDay();
+
+  const clientId = req.headers['x-papyrus-client-id'] || '';
+  const ip = getClientIp(req);
+  const anonIdent = clientId ? `device:${clientId}` : `ip:${ip}`;
+
+  const existingKey = anonKeyMap.get(anonIdent);
+  if (existingKey && validKeys.has(existingKey)) {
+    req.apiKey = existingKey;
+    next();
+    return;
+  }
+
+  const log = registerLog.get(ip);
+  if (log && log.date === getToday() && log.count >= 3) {
+    res.status(429).json({
       error: {
-        message: 'Invalid or missing API key. Get one at POST /v1/register',
-        type: 'authentication_error',
+        message: '该IP今日注册次数已达上限（3次）',
+        type: 'rate_limit_error',
       },
     });
     return;
   }
-  req.apiKey = token;
+
+  const newKey = generateKey();
+  validKeys.add(newKey);
+  anonKeyMap.set(anonIdent, newKey);
+  saveKeys();
+  saveAnonKeys();
+
+  if (!log || log.date !== getToday()) {
+    registerLog.set(ip, { date: getToday(), count: 1 });
+  } else {
+    log.count++;
+  }
+  saveRegisterLog();
+
+  req.apiKey = newKey;
   next();
 }
 
 // POST /v1/register — auto-issue an API key (no auth required)
 app.post('/v1/register', (req, res) => {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const ip = getClientIp(req);
   const today = getToday();
 
   resetIfNewDay();
@@ -289,8 +402,10 @@ app.use(express.static(path.join(__dirname), { index: 'index.html' }));
 
 loadUsage();
 loadKeys();
+loadRegisterLog();
+loadAnonKeys();
 app.listen(PORT, () => {
   console.log(`Papyrus LiYuan DeepSeek Proxy running on port ${PORT}`);
   console.log(`Daily quota: ${DAILY_QUOTA_PER_KEY.toLocaleString()} tokens per key`);
-  console.log(`Preset keys: ${PRESET_KEYS.length}, Registered keys: ${validKeys.size - PRESET_KEYS.length}`);
+  console.log(`Preset keys: ${PRESET_KEYS.length}, Registered keys: ${validKeys.size - PRESET_KEYS.length}, Anonymous mappings: ${anonKeyMap.size}`);
 });
